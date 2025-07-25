@@ -37,8 +37,7 @@ var ErrNotSupported = errors.New("feature not supported in new query engine")
 func New(opts logql.EngineOpts, cfg metastore.StorageConfig, bucket objstore.Bucket, limits logql.Limits, reg prometheus.Registerer, logger log.Logger) *QueryEngine {
 	var ms metastore.Metastore
 	if bucket != nil {
-		metastoreBucket := objstore.NewPrefixedBucket(bucket, opts.CataloguePath)
-		ms = metastore.NewObjectMetastore(cfg, metastoreBucket, logger, reg)
+		ms = metastore.NewObjectMetastore(cfg, bucket, logger, reg)
 	}
 
 	if opts.BatchSize <= 0 {
@@ -130,8 +129,16 @@ func (e *QueryEngine) Execute(ctx context.Context, params logql.Params) (logqlmo
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to create logical plan")
-		return logqlmodel.Result{}, err
+		level.Warn(logger).Log("msg", "failed to create logical plan", "err", err)
+		e.metrics.subqueries.WithLabelValues(statusNotImplemented).Inc()
+		return logqlmodel.Result{}, ErrNotSupported
 	}
+
+	level.Info(logger).Log(
+		"msg", "finished logical planning",
+		"plan", logicalPlan.String(),
+		"duration", durLogicalPlanning.Seconds(),
+	)
 
 	physicalPlan, err := func() (*physical.Plan, error) {
 		ctx, span := tracer.Start(ctx, "QueryEngine.Execute.physicalPlan")
@@ -139,11 +146,7 @@ func (e *QueryEngine) Execute(ctx context.Context, params logql.Params) (logqlmo
 
 		timer := prometheus.NewTimer(e.metrics.physicalPlanning)
 
-		catalogueType := physical.CatalogueTypeDirect
-		if e.opts.CataloguePath != "" {
-			catalogueType = physical.CatalogueTypeIndex
-		}
-		catalog := physical.NewMetastoreCatalog(ctx, e.metastore, catalogueType)
+		catalog := physical.NewMetastoreCatalog(ctx, e.metastore)
 		planner := physical.NewPlanner(physical.NewContext(params.Start(), params.End()), catalog)
 		plan, err := planner.Build(logicalPlan)
 		if err != nil {
